@@ -5,7 +5,7 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Queen Lingerie 💎 Alger</title>
-<link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,700;1,400&family=Tajawal:wght@300;400;500;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:ital,wght@0,400;0,700;1,400&family=Tajawal:wght@300;400;500;700&display=swap" rel="stylesheet">
 <style>
 :root {
   --fuchsia: #e91e8c;
@@ -1497,6 +1497,7 @@ display:none; align-items:center; justify-content:center;
 <div class="toast" id="toast"></div>
 
 <script>
+
 // ══════════════════════════════════════════
 // DATA
 // ══════════════════════════════════════════
@@ -1572,6 +1573,7 @@ function saveData(){
 function init(){
   setLang(currentLang);
   updateCartCount();
+  renderProducts();
 }
 
 var adminClickCount = 0;
@@ -2870,7 +2872,6 @@ function exportData(){
 // Apply config on load
 applyConfig();
 
-populateWilayas();
 initPixels();
 firePixelEvent('PageView', {});
 init();
@@ -2894,7 +2895,167 @@ function showAdminPanel(){
   renderPixelTab();
   renderSettings();
 }
+
+// ══════════════════════════════════════════
+// FIREBASE via REST API (no SDK needed — works everywhere)
+// ══════════════════════════════════════════
+var FB_PROJECT = 'queen-lingerie-ac6e4';
+var FB_API_KEY  = 'AIzaSyCv4Nk-JSJBg5JDyGk5js57GZ8XASgXQA4';
+var FB_BASE_URL = 'https://firestore.googleapis.com/v1/projects/' + FB_PROJECT + '/databases/(default)/documents/store/';
+var fbReady = false;
+var fbPollInterval = null;
+var lastOrderCount = 0;
+
+// ── Firestore REST helpers ──
+function fbGet(docName){
+  var url = FB_BASE_URL + docName + '?key=' + FB_API_KEY;
+  return fetch(url).then(function(r){
+    if(!r.ok) return null;
+    return r.json();
+  }).then(function(json){
+    if(!json || json.error) return null;
+    return fsDecodeDoc(json);
+  }).catch(function(){ return null; });
+}
+
+function fbSet(docName, data){
+  var url = 'https://firestore.googleapis.com/v1/projects/' + FB_PROJECT + '/databases/(default)/documents/store/' + docName + '?key=' + FB_API_KEY;
+  var body = { fields: fsEncodeDoc(data) };
+  return fetch(url, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  }).catch(function(){});
+}
+
+// ── Firestore value encoder ──
+function fsEncodeValue(val){
+  if(val === null || val === undefined) return { nullValue: null };
+  if(typeof val === 'boolean') return { booleanValue: val };
+  if(typeof val === 'number') return Number.isInteger(val) ? { integerValue: String(val) } : { doubleValue: val };
+  if(typeof val === 'string') return { stringValue: val };
+  if(Array.isArray(val)) return { arrayValue: { values: val.map(fsEncodeValue) } };
+  if(typeof val === 'object'){
+    var fields = {};
+    Object.keys(val).forEach(function(k){ fields[k] = fsEncodeValue(val[k]); });
+    return { mapValue: { fields: fields } };
+  }
+  return { stringValue: String(val) };
+}
+
+function fsEncodeDoc(obj){
+  var fields = {};
+  Object.keys(obj).forEach(function(k){ fields[k] = fsEncodeValue(obj[k]); });
+  return fields;
+}
+
+// ── Firestore value decoder ──
+function fsDecodeValue(v){
+  if(!v) return null;
+  if('nullValue'     in v) return null;
+  if('booleanValue'  in v) return v.booleanValue;
+  if('integerValue'  in v) return parseInt(v.integerValue);
+  if('doubleValue'   in v) return v.doubleValue;
+  if('stringValue'   in v) return v.stringValue;
+  if('arrayValue'    in v) return (v.arrayValue.values||[]).map(fsDecodeValue);
+  if('mapValue'      in v){
+    var obj = {};
+    var f = v.mapValue.fields||{};
+    Object.keys(f).forEach(function(k){ obj[k] = fsDecodeValue(f[k]); });
+    return obj;
+  }
+  return null;
+}
+
+function fsDecodeDoc(json){
+  if(!json || !json.fields) return null;
+  var obj = {};
+  Object.keys(json.fields).forEach(function(k){ obj[k] = fsDecodeValue(json.fields[k]); });
+  return obj;
+}
+
+// ── Save to Firebase (non-blocking) ──
+function fbSaveOrders(){
+  fbSet('orders', {
+    orders: orders,
+    orderCounter: orderCounter,
+    updatedAt: new Date().toISOString()
+  });
+}
+
+function fbSaveProducts(){
+  fbSet('products', {
+    products: products,
+    updatedAt: new Date().toISOString()
+  });
+}
+
+// ── Load from Firebase on start ──
+function syncFromFirebase(){
+  fbGet('products').then(function(doc){
+    if(doc && doc.products && doc.products.length > 0){
+      products = doc.products;
+      localStorage.setItem('ql_products', JSON.stringify(products));
+      renderProducts();
+    }
+  });
+  fbGet('config').then(function(doc){
+    if(doc){
+      if(doc.pixelConfig) pixelConfig = doc.pixelConfig;
+      if(doc.siteConfig){ siteConfig = doc.siteConfig; applyConfig(); }
+    }
+  });
+  fbGet('orders').then(function(doc){
+    if(doc && doc.orders){
+      orders = doc.orders;
+      orderCounter = doc.orderCounter || orderCounter;
+      localStorage.setItem('ql_orders', JSON.stringify(orders));
+      updateCartCount();
+    }
+  });
+  fbReady = true;
+  // Start polling for new orders (admin real-time)
+  startOrdersPolling();
+}
+
+// ── Poll for new orders every 10s (admin only) ──
+function startOrdersPolling(){
+  if(fbPollInterval) clearInterval(fbPollInterval);
+  fbPollInterval = setInterval(function(){
+    var panel = document.getElementById('adminPanel');
+    if(!panel || !panel.classList.contains('visible')) return;
+    fbGet('orders').then(function(doc){
+      if(!doc || !doc.orders) return;
+      if(doc.orders.length !== lastOrderCount){
+        lastOrderCount = doc.orders.length;
+        orders = doc.orders;
+        orderCounter = doc.orderCounter || orderCounter;
+        localStorage.setItem('ql_orders', JSON.stringify(orders));
+        updateCartCount();
+        renderStats();
+        renderOrdersTable();
+        showToast('🔔 طلب جديد وصل!', 'success');
+      }
+    });
+  }, 10000); // every 10 seconds
+}
+
+// ── Override saveData ──
+var _baseSaveData = saveData;
+saveData = function(){
+  _baseSaveData();
+  if(fbReady){
+    fbSaveOrders();
+    fbSaveProducts();
+  }
+};
+
+// ── Init Firebase after page renders ──
+setTimeout(syncFromFirebase, 500);
 </script>
 
+  <div style="color:#c9a96e;font-family:'Tajawal',sans-serif;font-size:16px;font-weight:600">جاري التحميل...</div>
+  <style>@keyframes spin{from{transform:rotate(0)}to{transform:rotate(360deg)}}</style>
+</div>
 </body>
 </html>
